@@ -279,3 +279,141 @@ def test_order_boundary_lengths_accepted():
     )
     # 参数合法；三段同为重复字，排列必有并列 -> 409
     assert resp.status_code == 409
+
+
+def test_revise_endpoint():
+    resp = client.post(
+        "/api/revise",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "edits": [{"segment": 2, "pos": 0, "char": "知"}],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "学而时习知不亦乐乎"
+    # sources 沿用 /api/assemble 的拼接结果
+    assert data["sources"] == client.post(
+        "/api/assemble",
+        json={"segments": ["学而?习之", "时习之不", "之不亦乐乎"]},
+    ).json()["sources"]
+    assert data["changes"] == [{
+        "pos": 4,
+        "from_char": "之",
+        "to_char": "知",
+        "edits": [{"index": 0, "segment": 2, "pos": 0, "char": "知"}],
+    }]
+
+
+def test_revise_merges_overlapping_edits_with_same_char():
+    # 位置 4 "之" 由段 0/1/2 重叠贡献，三项校订改字相同 -> 合并为一处修改
+    resp = client.post(
+        "/api/revise",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "edits": [
+                {"segment": 0, "pos": 4, "char": "知"},
+                {"segment": 1, "pos": 2, "char": "知"},
+                {"segment": 2, "pos": 0, "char": "知"},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "学而时习知不亦乐乎"
+    assert len(data["changes"]) == 1
+    assert [e["index"] for e in data["changes"][0]["edits"]] == [0, 1, 2]
+
+
+def test_revise_conflict_returns_409():
+    # 同一输出位置被指向不同改字
+    resp = client.post(
+        "/api/revise",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "edits": [
+                {"segment": 0, "pos": 4, "char": "甲"},
+                {"segment": 1, "pos": 2, "char": "乙"},
+            ],
+        },
+    )
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert [c["pos"] for c in detail["conflicts"]] == [4]
+    assert detail["conflicts"][0]["edits"] == [
+        {"index": 0, "segment": 0, "pos": 4, "char": "甲"},
+        {"index": 1, "segment": 1, "pos": 2, "char": "乙"},
+    ]
+
+
+def test_revise_out_of_range_coordinate_returns_422():
+    base = {"segments": ["学而?习之", "时习之不", "之不亦乐乎"]}
+    # 段序号越界
+    resp = client.post("/api/revise", json={**base, "edits": [{"segment": 3, "pos": 0, "char": "甲"}]})
+    assert resp.status_code == 422
+    # 原文下标越界（段 0 仅 5 字）
+    resp = client.post("/api/revise", json={**base, "edits": [{"segment": 0, "pos": 5, "char": "甲"}]})
+    assert resp.status_code == 422
+
+
+def test_revise_invalid_edit_rejected_422():
+    base = {"segments": ["学而?习之", "时习之不", "之不亦乐乎"]}
+    # 替换字为 "?"
+    assert client.post(
+        "/api/revise", json={**base, "edits": [{"segment": 0, "pos": 0, "char": "?"}]}
+    ).status_code == 422
+    # 替换字不是单个字符
+    assert client.post(
+        "/api/revise", json={**base, "edits": [{"segment": 0, "pos": 0, "char": "甲乙"}]}
+    ).status_code == 422
+    assert client.post(
+        "/api/revise", json={**base, "edits": [{"segment": 0, "pos": 0, "char": ""}]}
+    ).status_code == 422
+    # 段序号 / 下标为负数
+    assert client.post(
+        "/api/revise", json={**base, "edits": [{"segment": -1, "pos": 0, "char": "甲"}]}
+    ).status_code == 422
+    assert client.post(
+        "/api/revise", json={**base, "edits": [{"segment": 0, "pos": -1, "char": "甲"}]}
+    ).status_code == 422
+    # 缺 edits 字段
+    assert client.post("/api/revise", json=base).status_code == 422
+
+
+def test_revise_no_partial_revision_on_invalid_edit():
+    # 第一项合法、第二项越界：整体 422，不返回修订文本
+    resp = client.post(
+        "/api/revise",
+        json={
+            "segments": ["学而?习之", "时习之不", "之不亦乐乎"],
+            "edits": [
+                {"segment": 0, "pos": 0, "char": "孔"},
+                {"segment": 9, "pos": 0, "char": "甲"},
+            ],
+        },
+    )
+    assert resp.status_code == 422
+    assert "text" not in resp.json()
+
+
+def test_revise_empty_edits_returns_assembled_text():
+    resp = client.post(
+        "/api/revise",
+        json={"segments": ["学而?习之", "时习之不", "之不亦乐乎"], "edits": []},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["text"] == "学而时习之不亦乐乎"
+    assert data["changes"] == []
+
+
+def test_revise_gate_failure_returns_422_with_failed_segment():
+    resp = client.post(
+        "/api/revise",
+        json={
+            "segments": ["孔子曰未知", "未知生焉", "完全无关文本"],
+            "edits": [{"segment": 0, "pos": 0, "char": "甲"}],
+        },
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["failed_segment"] == 2
