@@ -9,12 +9,15 @@
 - ``POST /api/order``：提交 2～4 段**未排序**转写（单段不超过 100 字、总长不
   超过 240 字），穷举全部排列，逐段复用上述续接门槛与累计对齐得分选出阅读
   顺序，返回原输入下标顺序、拼接文本与按原输入下标标记的逐字来源。
+- ``POST /api/revise``：沿用 ``/api/assemble`` 的有序 segments 与拼接结果，
+  把人工校订（段序号 + 原文下标 + 替换字）经逐字来源定位到最终文本后改写，
+  返回修订后文本、沿用的逐字来源与逐位置修订记录。
 """
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .aligner import align
+from .aligner import WILDCARD, align
 from .assembler import AssemblyError, assemble
 from .collator import collate
 from .orderer import (
@@ -30,6 +33,7 @@ from .orderer import (
     MIN_SEGMENTS as ORDER_MIN_SEGMENTS,
 )
 from .orderer import NoCompleteOrderError, OrderTieError, determine_order
+from .reviser import RevisionConflictError, RevisionError, revise
 
 MAX_TEXT_LEN = 500   # 单段文本最大长度（残页转写通常远小于此）
 MAX_SEGMENTS = 5     # /api/assemble 最大段数
@@ -199,6 +203,67 @@ class CollateResponse(BaseModel):
     )
 
 
+class EditItem(BaseModel):
+    """单条人工校订：将某段某字校为指定字形。"""
+
+    segment: int = Field(..., description="原始段序号（从 0 开始）", examples=[0])
+    pos: int = Field(..., description="该字在原始段中的下标（从 0 开始）", examples=[2])
+    char: str = Field(
+        ...,
+        min_length=1,
+        max_length=1,
+        description="替换字：单个非 ? 字符",
+        examples=["時"],
+    )
+
+    @field_validator("char")
+    @classmethod
+    def _char_not_wildcard(cls, v: str) -> str:
+        if v == WILDCARD:
+            raise ValueError("替换字不能为 ?（未辨认字占位符）")
+        return v
+
+
+class ReviseRequest(AssembleRequest):
+    """人工校订请求：/api/assemble 的有序 segments 加校订列表。"""
+
+    edits: list[EditItem] = Field(
+        ...,
+        description="人工校订列表（可为空）；每项按段序号与原文下标定位，"
+                    "经逐字来源映射到最终文本位置",
+        examples=[[
+            {"segment": 0, "pos": 2, "char": "時"},
+            {"segment": 1, "pos": 0, "char": "時"},
+        ]],
+    )
+
+
+class Change(BaseModel):
+    """一个输出位置的修订记录。"""
+
+    pos: int = Field(..., description="在拼接文本中的位置（下标从 0 开始）")
+    from_char: str = Field(..., alias="from", description="原字（修订前）")
+    to_char: str = Field(..., alias="to", description="新字（修订后）")
+    edits: list[EditItem] = Field(
+        ...,
+        description="关联的校订项：指向同一位置且改字相同者已合并",
+    )
+
+
+class ReviseResponse(BaseModel):
+    """人工校订结果。"""
+
+    text: str = Field(..., description="修订后的文本（未涉及位置保持原字）")
+    sources: list[list[CharSource]] = Field(
+        ...,
+        description="逐字来源列表，与 /api/assemble 的结果一致",
+    )
+    changes: list[Change] = Field(
+        ...,
+        description="逐位置修订记录，按位置升序；含原字、新字与关联校订项",
+    )
+
+
 class OrderRequest(BaseModel):
     """未排序多段转写的排序请求。"""
 
@@ -251,6 +316,7 @@ def index():
         "assemble": "POST /api/assemble",
         "collate": "POST /api/collate",
         "order": "POST /api/order",
+        "revise": "POST /api/revise",
         "docs": "/docs",
         "health": "/health",
     }
@@ -398,6 +464,83 @@ def api_order(req: OrderRequest):
             },
         ) from exc
     except NoCompleteOrderError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": str(exc)},
+        ) from exc
+
+
+@app.post(
+    "/api/revise",
+    response_model=ReviseResponse,
+    status_code=200,
+    summary="人工校订：按段坐标改字并返回修订后文本",
+    description=(
+        "请求在 `/api/assemble` 的有序 segments（2～5 段、单段最长 500 字、"
+        "总长最长 800 字、同一续接门槛，断链返回 422 并给出 failed_segment）之上"
+        "附加人工校订 edits（每项含段序号 segment、原文下标 pos、替换字 char，"
+        "char 须为单个非 `?` 字符）。先复用拼接得到 text 与逐字来源，再把每项校订"
+        "经来源定位到最终文本的唯一输出位置：重叠段指向同一位置且改字相同者合并"
+        "为一处修改，改字不同返回 **409** 并列出冲突位置与校订项；段序号或下标"
+        "越界、坐标未映射或映射到多个输出位置均返回 **422**，且不产生部分修订。"
+        "不重新对齐，未涉及位置保持原字。返回修订后 text、沿用的 sources 与逐位置"
+        " changes（含原字、新字、关联校订项）。"
+    ),
+    responses={
+        409: {
+            "description": "同一输出位置收到不一致的校订改字",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {
+                            "message": "输出位置 2 收到不一致的校订改字，无法确定修订结果",
+                            "conflicts": [
+                                {
+                                    "pos": 2,
+                                    "edits": [
+                                        {"segment": 0, "pos": 2, "char": "時"},
+                                        {"segment": 1, "pos": 0, "char": "明"},
+                                    ],
+                                }
+                            ],
+                        }
+                    }
+                }
+            },
+        },
+        422: {
+            "description": "拼接断链，或校订坐标越界 / 未映射 / 映射到多个输出位置"
+                           "（或请求参数不合法）",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": {"message": "第 1 项校订的段序号 3 越界（共 3 段）"}
+                    }
+                }
+            },
+        },
+    },
+)
+def api_revise(req: ReviseRequest):
+    try:
+        return revise(req.segments, [e.model_dump() for e in req.edits])
+    except AssemblyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "failed_segment": exc.failed_segment,
+            },
+        ) from exc
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "conflicts": exc.conflicts,
+            },
+        ) from exc
+    except RevisionError as exc:
         raise HTTPException(
             status_code=422,
             detail={"message": str(exc)},
